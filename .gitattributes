@@ -2,3 +2,7 @@
 *.sh text eol=lf
 S99zdropbear text eol=lf
 *.asoundrc text eol=lf
+station/S99zjarvis text eol=lf
+# Запуск на Windows — CRLF.
+*.cmd text eol=crlf
+*.vbs text eol=crlf

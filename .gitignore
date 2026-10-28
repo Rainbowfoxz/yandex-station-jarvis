@@ -12,3 +12,6 @@ led/gold/
 privacy/backup/
 privacy/new/
 jarvis-og-wav/
+station/dist/
+station/jarvis/jarvis
+!station/beep.wav

@@ -12,9 +12,11 @@
 import io
 import os
 import pathlib
+import queue
 import random
 import re
 import sys
+import threading
 import time
 import wave
 
@@ -35,6 +37,7 @@ TIMEOUT_MS = 10000            # меньше сервер не принимае�
 # Тайм-аут модели — 10 с ожидания; две такие подряд колонка молчала бы 20+ с. Новые модели после этого
 # срока не пробуем — вопрос уходит Алисе.
 TRY_SECONDS = 15
+RACE = 3                      # сколько моделей спрашиваем одновременно (у каждой своя квота 5 в минуту)
 # Удачная запасная модель пробуется первой, но через 10 мин снова начинаем с основной: lite быстрее (1–3 с
 # против 3–5 с у 3.6), а её сбои обычно проходят. Пока она лежит — раз в 10 мин один ответ на 10 с дольше.
 BACK_TO_PRIMARY = 600
@@ -197,22 +200,40 @@ class Brain:
         self.last = time.monotonic()
 
     def _stream(self, contents):
-        # Удачная модель — первой, но при её сбое (503 «высокий спрос») пробуем и остальные.
-        # Сбой обычно приходит до первого куска — тогда следующая модель; посреди ответа — ошибка.
+        # Удачная модель — первой, но спрашиваем сразу RACE моделей и берём ту, что первой начала отвечать:
+        # по очереди зависшая модель съедала 10 с тайм-аута (28.10: lite молчала, ответ через 14–16 с).
+        # Сбой модели (503, 429, тайм-аут) — вместо неё в гонку встаёт следующая по списку.
+        # Сбой обычно приходит до первого куска; посреди ответа — ошибка.
         if self.model != MODELS[0] and time.monotonic() - self.fallback_at > BACK_TO_PRIMARY:
             self.model = None
-        models = sorted(MODELS, key=lambda m: m != self.model)
-        error, give_up = None, time.monotonic() + TRY_SECONDS
-        for model in models:
-            if error and time.monotonic() > give_up:
-                break
+        waiting = sorted(MODELS, key=lambda m: m != self.model)
+        results = queue.Queue()
+
+        def start(model):
             try:
                 stream = self.client.models.generate_content_stream(model=model, contents=contents,
                                                                     config=self.configs[model])
-                first = next(stream, None)
-            except Exception as exc:   # модели нет на этом ключе — пробуем следующую
+                results.put((model, stream, next(stream, None), None))
+            except Exception as exc:   # модели нет на этом ключе, перегрузка, тайм-аут
+                results.put((model, None, None, exc))
+
+        running, error, give_up = 0, None, time.monotonic() + TRY_SECONDS
+        while running < RACE and waiting:
+            threading.Thread(target=start, args=(waiting.pop(0),), daemon=True).start()
+            running += 1
+        while running:
+            try:
+                model, stream, first, exc = results.get(timeout=max(0.1, give_up - time.monotonic()))
+            except queue.Empty:
+                break
+            running -= 1
+            if exc is not None:
                 error = exc
+                if waiting and time.monotonic() < give_up:
+                    threading.Thread(target=start, args=(waiting.pop(0),), daemon=True).start()
+                    running += 1
                 continue
+            # Остальные участники гонки дорабатывают в своих потоках, их ответы не читаем.
             if model != MODELS[0] and model != self.model:   # отсчёт 10 мин — с перехода на запасную
                 self.fallback_at = time.monotonic()
             self.model = model
@@ -220,7 +241,7 @@ class Brain:
                 if chunk.text:
                     yield chunk.text
             return
-        raise error
+        raise error or TimeoutError(f'ни одна модель не ответила за {TRY_SECONDS} с')
 
 
 def prefix_of(head, marker):

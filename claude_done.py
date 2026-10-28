@@ -28,6 +28,7 @@ STAMP = pathlib.Path(tempfile.gettempdir()) / 'claude_done.stamp'
 STATE = pathlib.Path(tempfile.gettempdir()) / 'claude_done'
 SILENT = 20 * 60    # журнал агента не менялся 20 мин — агент мёртв (сессию перезапустили, уведомления не будет)
 CHUNK = 64 << 20
+TAIL = 8 << 20      # где искать начало хода: последние 8 МБ журнала
 
 # SendMessage остановленному агенту продолжает его в фоне: результат с resumedAgentId, уведомление о конце
 # придёт с id вызова SendMessage.
@@ -43,9 +44,13 @@ TASK_ID = re.compile(rb'<task-id>(\w+)</task-id>')
 STATUS = re.compile(rb'<status>(\w+)</status>')
 
 
+def state_path(transcript):
+    return STATE / (re.sub(r'\W', '_', transcript.stem) + '.json')
+
+
 def scan(transcript):
     """Дочитать журнал с прошлого места; вернуть {id вызова: agentId или ''} запущенных и не закончившихся."""
-    state_file = STATE / (re.sub(r'\W', '_', transcript.stem) + '.json')
+    state_file = state_path(transcript)
     try:
         state = json.loads(state_file.read_text(encoding='utf-8'))
     except (OSError, ValueError):
@@ -93,7 +98,9 @@ def scan(transcript):
                     status = STATUS.search(block)
                     if status and status[1] in (b'running', b'pending'):
                         continue
-                    ended = {c.decode() for c in TOOL_USE_ID.findall(block)}
+                    # Только запуски агентов: уведомления о фоновых командах и мониторах сюда не попадают —
+                    # по finished wanted() решает, что ход начал конец агента.
+                    ended = {c.decode() for c in TOOL_USE_ID.findall(block)} & (calls.keys() | running.keys())
                     if not ended:                   # «N background tasks stopped» — только task-id агентов
                         agents = {a.decode() for a in TASK_ID.findall(block)}
                         ended = {call for call, agent in running.items() if agent in agents}
@@ -124,6 +131,43 @@ def busy_agents(transcript):
                 else any(fresh(p) for p in folder.glob('agent-*.jsonl')))]
 
 
+def turn_start(transcript):
+    """Чем начат последний ход: (origin.kind, текст) последней записи-запроса — не результата инструмента.
+    Записи без origin (старые журналы) считаем сообщением пользователя."""
+    with open(transcript, 'rb') as f:
+        f.seek(max(0, transcript.stat().st_size - TAIL))
+        lines = f.read().split(b'\n')
+    for line in reversed(lines):
+        if b'"type":"user"' not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        content = record.get('message', {}).get('content')
+        if record.get('type') != 'user' or record.get('isMeta'):
+            continue
+        if isinstance(content, list):
+            if any(part.get('type') == 'tool_result' for part in content if isinstance(part, dict)):
+                continue
+            content = ' '.join(part.get('text', '') for part in content if isinstance(part, dict))
+        return (record.get('origin') or {}).get('kind', 'human'), str(content)
+    return 'human', ''
+
+
+def wanted(transcript):
+    """Говорить, если ход начал пользователь или уведомление о конце агента. Ход от события монитора или
+    конца фоновой команды — молчим: 28.10 колонка твердила «Запрос выполнен» на каждое событие журнала."""
+    kind, text = turn_start(transcript)
+    if kind != 'task-notification':
+        return True
+    try:
+        finished = set(json.loads(state_path(transcript).read_text(encoding='utf-8')).get('finished', []))
+    except (OSError, ValueError):
+        finished = set()
+    return any(call.decode() in finished for call in TOOL_USE_ID.findall(text.encode()))
+
+
 def main():
     if sys.argv[1:2] == ['--agents']:
         print(busy_agents(pathlib.Path(sys.argv[2])))
@@ -135,7 +179,7 @@ def main():
     if event.get('stop_hook_active'):
         return 0
     transcript = pathlib.Path(event.get('transcript_path') or '')
-    if transcript.is_file() and busy_agents(transcript):
+    if transcript.is_file() and (busy_agents(transcript) or not wanted(transcript)):
         return 0
     try:
         if time.time() - STAMP.stat().st_mtime < COOLDOWN:

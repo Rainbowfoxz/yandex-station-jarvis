@@ -26,17 +26,18 @@ import random
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
 import wave
 
 import numpy as np
-import vosk
-from scipy.signal import firwin, lfilter
 
 import alice_say
 from aec import REF_ACTIVE, EchoCanceller
+# vosk и scipy грузятся только в обычном режиме (main, MicDecoder): в --station имя ловит колонка,
+# а эти библиотеки занимали ~200 МБ памяти зря.
 from ask_text import text_frame
 from gemini_brain import Brain
 from jarvis import SSH
@@ -77,8 +78,6 @@ ASK_FILE = pathlib.Path(os.environ.get('TEMP', '.')) / 'jarvis_ask.txt'   # во
 ALICE_IDLE = 60.0            # соединение с Алисой простояло дольше — перед отправкой открываем новое
 DEBUG = bool(os.environ.get('JARVIS_DEBUG'))  # печатать поток и всё распознанное
 
-# 48 -> 16 кГц: ФНЧ с состоянием между кусками (без щелчков на стыках) и каждый третий отсчёт.
-TAPS = firwin(63, 7000, fs=48000)
 
 
 class MicDecoder:
@@ -86,7 +85,10 @@ class MicDecoder:
     из которого вычтено то, что играет динамик (музыка, голос Алисы) — см. aec.py."""
 
     def __init__(self, cancel_echo=True):
-        self.zi = np.zeros((len(TAPS) - 1, 1 + len(REFS)))
+        from scipy.signal import firwin, lfilter
+        # 48 -> 16 кГц: ФНЧ с состоянием между кусками (без щелчков на стыках) и каждый третий отсчёт.
+        self.taps, self.lfilter = firwin(63, 7000, fs=48000), lfilter
+        self.zi = np.zeros((len(self.taps) - 1, 1 + len(REFS)))
         self.phase = 0
         self.rest = b''
         self.aec = EchoCanceller(len(REFS)) if cancel_echo else None
@@ -104,7 +106,7 @@ class MicDecoder:
         cut = len(block) // FRAME * FRAME
         block, self.rest = block[:cut], block[cut:]
         frames = np.frombuffer(block, '<i2').reshape(-1, CHANNELS)[:, [MIC, *REFS]].astype(np.float64)
-        filtered, self.zi = lfilter(TAPS, 1.0, frames, axis=0, zi=self.zi)
+        filtered, self.zi = self.lfilter(self.taps, 1.0, frames, axis=0, zi=self.zi)
         down = filtered[self.phase::3]
         self.phase = (self.phase - len(frames)) % 3
         level = (down[:, 1:] - down[:, 1:].mean(axis=0)).std() if len(down) else 0.0
@@ -132,13 +134,14 @@ def question_after_wake(text, heard):
 class Session:
     """Подключения к одной колонке: туннель к Алисе, оболочка для звука и подсветки, поток микрофона."""
 
-    def __init__(self):
+    def __init__(self, audio=True):
         self.tunnel = open_tunnel()
         self.alice = socket.create_connection(('127.0.0.1', LOCAL_PORT))
         self.alice_used = time.monotonic()
         self.shell = subprocess.Popen(SSH + ['sh'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+        # --station: имя ловит сама колонка — поток микрофона не нужен.
         self.audio = subprocess.Popen(SSH + ['sh /data/opt/jarvis/pull.sh'], stdin=subprocess.DEVNULL,
-                                      stdout=subprocess.PIPE, bufsize=0)
+                                      stdout=subprocess.PIPE, bufsize=0) if audio else None
         self.lock = threading.Lock()   # Gemini отвечает из своего потока — не перемешать кадры и команды
         self.busy = False              # Gemini ещё думает над прошлым вопросом
         # Под музыкой вопрос распознаёт Алиса: её события читаем отдельным подключением.
@@ -146,9 +149,13 @@ class Session:
         self.capture_deadline = 0.0
         self.on_question = None        # куда отдать перехваченный текст (ставит run)
         self.speaking = 0.0            # когда Джарвис начал говорить (0 — молчит): журнал событий Алисы
-        self.events = socket.create_connection(('127.0.0.1', LOCAL_PORT))
-        self.events.sendall(alice_say.rpc_frame(20, alice_say.byte_field(1, b'AliceCapability')))
-        threading.Thread(target=self._read_events, daemon=True).start()
+        self.events = None
+        if audio:
+            # Не в --station: события Алисы читает программа на колонке, а вторая подписка их у неё
+            # отбирает (28.10: после запуска ПК колонка перестала получать распознанные вопросы).
+            self.events = socket.create_connection(('127.0.0.1', LOCAL_PORT))
+            self.events.sendall(alice_say.rpc_frame(20, alice_say.byte_field(1, b'AliceCapability')))
+            threading.Thread(target=self._read_events, daemon=True).start()
 
     def capture(self):
         """Алиса приглушает музыку и слушает; её распознанный текст заберёт _read_events."""
@@ -236,9 +243,11 @@ class Session:
 
     def close(self):
         for proc in (self.audio, self.shell, self.tunnel):
-            proc.terminate()
+            if proc:
+                proc.terminate()
         self.alice.close()
-        self.events.close()
+        if self.events:
+            self.events.close()
 
 
 class Speech:
@@ -563,7 +572,70 @@ def run(session, wake, full, brain):
         full.Reset()
 
 
+# --station: «Джарвис» ловит сама колонка (jarvis-station: программа jarvis в режиме pc), Алиса распознаёт
+# вопрос, колонка кладёт его строкой в канал /tmp/jarvis-q. Читатель держит канал открытым (3<>), пока жив:
+# пока его нет, колонка отдаёт вопрос Алисе. Раз в 5 с — PING: запись в оборванный SSH роняет читателя,
+# и канал освобождается. Без канала (программа на колонке не запущена) читатель выходит — `<>` создал бы
+# вместо канала обычный файл.
+STATION_READER = ('[ -p /tmp/jarvis-q ] || { echo NOFIFO; exit 3; }; exec 3<>/tmp/jarvis-q; '
+                  'while :; do if read -r -t 5 q <&3; then echo "Q $q"; else echo PING; fi || exit 0; done')
+
+
+def run_station(session, brain):
+    reader = subprocess.Popen(SSH + [STATION_READER], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+    try:
+        for raw in reader.stdout:
+            line = raw.decode('utf-8', errors='replace').strip()
+            if line == 'NOFIFO':
+                print('На колонке не запущен jarvis в режиме pc (нет /tmp/jarvis-q).', flush=True)
+            question = line[2:].strip() if line.startswith('Q ') else (check_ask_file(session) or '')
+            if not question:
+                continue
+            stamp = time.strftime('%H:%M:%S')
+            if session.busy:
+                print(f'{stamp} «{question}» — пропущен: Gemini ещё отвечает на прошлый', flush=True)
+                continue
+            print(f'{stamp} колонка: «{question}» -> Gemini', flush=True)
+            session.busy = True
+            threading.Thread(target=answer, args=(session, brain, question, None), daemon=True).start()
+    finally:
+        reader.terminate()
+
+
+def check_ask_file(session):
+    """Проверочный вопрос из ASK_FILE (как в run): текст для Gemini или '' (в том числе «!…» — сразу Алисе)."""
+    if not ASK_FILE.exists() or session.busy:
+        return ''
+    text = ASK_FILE.read_text(encoding='utf-8').strip()
+    ASK_FILE.unlink()
+    if text.startswith('!'):
+        session.ask(text[1:].strip())
+        return ''
+    return text
+
+
+def main_station():
+    brain = Brain()
+    print('Джарвис: имя ловит колонка, ответы — Gemini и голос с этого ПК. Ctrl+C — выход.', flush=True)
+    try:
+        while True:
+            session = None
+            try:
+                session = Session(audio=False)
+                run_station(session, brain)
+                print('Связь с колонкой прервалась, переподключаюсь.', flush=True)
+            except (OSError, RuntimeError) as error:
+                print(f'Нет связи с колонкой ({error}), повтор через {RECONNECT:g} с.', flush=True)
+            finally:
+                if session:
+                    session.close()
+            time.sleep(RECONNECT)
+    except KeyboardInterrupt:
+        print('Выход.')
+
+
 def main():
+    import vosk
     vosk.SetLogLevel(-1)
     model = vosk.Model(str(MODEL))
     wake = vosk.KaldiRecognizer(model, 16000, GRAMMAR)
@@ -591,4 +663,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    main_station() if '--station' in sys.argv[1:] else main()

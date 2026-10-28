@@ -1,0 +1,12 @@
+Сторонние компоненты в архиве jarvis-station-aarch64:
+
+- lib/libvosk.so — Vosk API 0.3.45 (alphacep/vosk-api), Apache License 2.0.
+- model/ — vosk-model-small-ru-0.22 (alphacephei.com/vosk/models), Apache License 2.0.
+- lib/ld-linux-aarch64.so.1, libc.so.6, libm.so.6, libpthread.so.0, libdl.so.2 — GNU C Library 2.31
+  из пакета Debian 11 libc6 2.31-13+deb11u11 (arm64), GNU LGPL 2.1. Исходники:
+  https://sources.debian.org/src/glibc/2.31-13+deb11u11/
+- lib/libstdc++.so.6, libgcc_s.so.1, libatomic.so.1 — GCC 10.2.1 из пакетов Debian 11 libstdc++6,
+  libgcc-s1, libatomic1 10.2.1-6 (arm64), GPL 3 с GCC Runtime Library Exception. Исходники:
+  https://sources.debian.org/src/gcc-10/10.2.1-6/
+- jarvis — собран Go; включает golang.org/x/crypto/x509roots/fallback (BSD-3-Clause, корневые
+  сертификаты Mozilla — MPL 2.0).

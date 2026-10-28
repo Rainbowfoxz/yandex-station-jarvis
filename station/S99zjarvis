@@ -1,0 +1,6 @@
+#!/bin/sh
+# Автозапуск Джарвиса на колонке (удалить этот файл, чтобы убрать). Всё остальное — в /data/opt/jarvis/station.
+case "$1" in
+  start|stop|restart) sh /data/opt/jarvis/station/run.sh "$1" ;;
+esac
+exit 0
