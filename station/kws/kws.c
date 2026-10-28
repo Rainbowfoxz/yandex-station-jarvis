@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include "aec.h"
 #include "vosk_api.h"
 
@@ -26,8 +27,27 @@
 // а с KWS_GATE=1 имя тогда не засчитывается (так было до вычитания эха: голос Алисы ловец принимал
 // за «Джарвис»).
 #define SPEAKER_HOLD 72000
+// Звук каждого кандидата (после вычитания эха, 16 кГц S16LE): CLIP_BEFORE до него и CLIP_AFTER после —
+// под музыкой кандидат приходит посреди слова. Последние CLIPS файлов в папке KWS_CLIPS (/tmp — оперативная
+// память, 30 × 80 КБ); номер файла пишется в журнал у кандидата. По ним подбирается вторая проверка на ПК.
+#define CLIP_BEFORE 32000
+#define CLIP_AFTER 8000
+#define CLIP (CLIP_BEFORE + CLIP_AFTER)
+#define CLIPS 30
 
 static float taps[TAPS];
+static short ring[CLIP];  // последние CLIP отсчётов 16 кГц по кругу
+static long heard;        // отсчётов 16 кГц с начала
+
+static void save_clip(const char *dir, int slot) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%02d.raw", dir, slot);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    long n = heard < CLIP ? heard : CLIP;
+    for (long i = heard - n; i < heard; i++) fwrite(&ring[i % CLIP], sizeof(short), 1, f);
+    fclose(f);
+}
 
 static void make_taps(void) {
     // Окно Хэмминга, срез 7 кГц при 48 кГц: ниже половины новой частоты 16 кГц.
@@ -81,6 +101,11 @@ int main(int argc, char **argv) {
     // KWS_GATE=1 — как до вычитания эха: пока звучит динамик, имя не засчитывать.
     int gate = getenv("KWS_GATE") != NULL;
     int cancel = getenv("KWS_NO_AEC") == NULL;  // KWS_NO_AEC=1 — без вычитания (сравнение на записях)
+    const char *clips = getenv("KWS_CLIPS");    // KWS_CLIPS= (пусто) — не сохранять
+    if (!clips) clips = "/tmp/jarvis-clips";
+    if (*clips) mkdir(clips, 0755);
+    int clip_slot = 0;
+    long clip_at = -1;  // когда (в отсчётах 16 кГц) сохранить звук последнего кандидата
     make_taps();
     static Aec aec;
     aec_init(&aec, 1);
@@ -136,6 +161,12 @@ int main(int argc, char **argv) {
         }
         for (int c = 0; c < 3; c++) memmove(pend[c], pend[c] + done, (pending - done) * sizeof(float));
         pending -= done;
+        for (int i = 0; i < m; i++) ring[heard++ % CLIP] = out[i];
+        if (clip_at >= 0 && heard >= clip_at) {
+            save_clip(clips, clip_slot);
+            clip_slot = (clip_slot + 1) % CLIPS;
+            clip_at = -1;
+        }
         if (!m) continue;
         int music = total - played < SPEAKER_HOLD;
         double seconds = 0, conf;
@@ -160,12 +191,21 @@ int main(int argc, char **argv) {
         if (conf < conf_min) verdict = "мало уверенности";
         else if (total < quiet_until) verdict = "повтор";
         else if (gate && music) verdict = "звучит динамик";
+        char clip[32] = "";
+        if (*clips) {
+            if (clip_at >= 0) {  // прошлый кандидат ещё не сохранён — сохраняем как есть
+                save_clip(clips, clip_slot);
+                clip_slot = (clip_slot + 1) % CLIPS;
+            }
+            clip_at = heard + CLIP_AFTER;
+            snprintf(clip, sizeof clip, " [звук %02d.raw]", clip_slot);
+        }
         if (seconds > 0)
-            fprintf(stderr, "%.1f с: «джарвис» уверенность %.2f, %.2f с%s -> %s\n", total / 48000.0, conf,
-                    seconds, music ? ", звучит динамик" : "", verdict);
+            fprintf(stderr, "%.1f с: «джарвис» уверенность %.2f, %.2f с%s -> %s%s\n", total / 48000.0, conf,
+                    seconds, music ? ", звучит динамик" : "", verdict, clip);
         else
-            fprintf(stderr, "%.1f с: «джарвис» под музыкой (промежуточный результат) -> %s\n", total / 48000.0,
-                    verdict);
+            fprintf(stderr, "%.1f с: «джарвис» под музыкой (промежуточный результат) -> %s%s\n",
+                    total / 48000.0, verdict, clip);
         if (verdict[0] == 'W') {
             quiet_until = total + QUIET_FRAMES;
             puts("WAKE");
