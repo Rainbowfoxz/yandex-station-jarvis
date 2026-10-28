@@ -95,8 +95,13 @@ py -m pip install vosk numpy scipy soundfile google-genai faster-whisper
 Окружение для голоса (отдельно, в `~/Downloads/f5-tts/venv`): `f5-tts`, `torch` с CUDA, `ruaccent`,
 `soundfile`, `huggingface_hub`; для дообучения ещё `bitsandbytes`, `speechbrain`, `demucs`, `num2words`.
 
-Модель ESpeech скачивается с Hugging Face при первом запуске. Дообученная модель и образцы голоса — в отдельном
-архиве `yandex-station-jarvis-voice` (распаковать в `~/Downloads`).
+Модель ESpeech скачивается с Hugging Face при первом запуске. Дообученная модель и образцы голоса — архив
+`yandex-station-jarvis-voice.zip` в релизе [voice-v1](../../releases/tag/voice-v1) (0,68 ГБ, в git не помещается),
+распаковать в `~/Downloads`:
+
+```
+gh release download voice-v1 -R Rainbowfoxz/yandex-station-jarvis
+```
 
 ## Запуск
 
