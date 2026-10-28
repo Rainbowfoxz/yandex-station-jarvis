@@ -1,0 +1,11 @@
+pcm.jarvis_tap {
+    type file
+    slave.pcm "hw_feedback_and_mics_raw"
+    file "|/tmp/jt/sink.sh"
+    format "raw"
+}
+
+pcm.!capture_fault_inject {
+    type fault_inject
+    slave.pcm "jarvis_tap"
+}

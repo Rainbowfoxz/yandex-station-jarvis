@@ -1,0 +1,14 @@
+jarvis.local.json
+.env
+__pycache__/
+*.raw
+*.wav
+*.pt
+*.led
+*.orig
+mic/asound.conf
+led/orig/
+led/gold/
+privacy/backup/
+privacy/new/
+jarvis-og-wav/

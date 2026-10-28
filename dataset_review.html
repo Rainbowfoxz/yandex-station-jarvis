@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Отбор реплик Джарвиса</title>
+<style>
+  :root {
+    --bg: #f6f4ef; --card: #fff; --ink: #1d1b16; --muted: #6f6a60; --line: #e2ded4;
+    --gold: #b8860b; --ok: #2e7d32; --noise: #b26a00; --no: #b3261e; --cur: #fff6dc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #15140f; --card: #1f1d17; --ink: #ece7da; --muted: #9d968a; --line: #34312a;
+            --gold: #e0b44c; --ok: #66bb6a; --noise: #f0a040; --no: #ef6b62; --cur: #2c2717; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 system-ui, sans-serif; }
+  header { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line);
+           padding: 12px 16px; display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+  h1 { font-size: 18px; margin: 0; color: var(--gold); }
+  .keys { color: var(--muted); font-size: 13px; }
+  kbd { border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 5px;
+        font: 12px ui-monospace, monospace; background: var(--card); }
+  .bar { flex: 1 1 200px; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--gold); width: 0; }
+  button { font: inherit; cursor: pointer; border: 1px solid var(--line); background: var(--card); color: var(--ink);
+           border-radius: 6px; padding: 5px 10px; }
+  button.save { background: var(--gold); color: #fff; border-color: var(--gold); font-weight: 600; }
+  label.f { color: var(--muted); font-size: 13px; display: flex; gap: 6px; align-items: center; }
+  main { max-width: 980px; margin: 0 auto; padding: 12px 16px 80px; }
+  .row { display: grid; grid-template-columns: 44px 1fr auto; gap: 6px 12px; align-items: center;
+         background: var(--card); border: 1px solid var(--line); border-left: 4px solid var(--line);
+         border-radius: 8px; padding: 8px 10px; margin: 6px 0; }
+  .row.cur { background: var(--cur); outline: 2px solid var(--gold); }
+  .row[data-v="1"] { border-left-color: var(--ok); }
+  .row[data-v="2"] { border-left-color: var(--noise); }
+  .row[data-v="3"] { border-left-color: var(--no); opacity: .6; }
+  .play { width: 40px; height: 40px; border-radius: 50%; font-size: 15px; padding: 0; }
+  .meta { color: var(--muted); font-size: 12px; }
+  .note { color: var(--noise); }
+  .text { width: 100%; font: inherit; color: var(--ink); background: transparent; border: 1px dashed transparent;
+          border-radius: 4px; padding: 2px 4px; }
+  .text:hover, .text:focus { border-color: var(--line); outline: none; }
+  .text.edited { border-color: var(--gold); }
+  .choice { display: flex; gap: 4px; }
+  .choice button { font-size: 13px; padding: 4px 8px; }
+  .row[data-v="1"] .c1 { background: var(--ok); color: #fff; border-color: var(--ok); }
+  .row[data-v="2"] .c2 { background: var(--noise); color: #fff; border-color: var(--noise); }
+  .row[data-v="3"] .c3 { background: var(--no); color: #fff; border-color: var(--no); }
+  .hidden { display: none; }
+  @media (max-width: 640px) {
+    .row { grid-template-columns: 44px 1fr; }
+    .choice { grid-column: 1 / -1; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Отбор реплик Джарвиса</h1>
+  <span id="count"></span>
+  <div class="bar"><i id="bar"></i></div>
+  <label class="f"><input type="checkbox" id="todo"> только неотмеченные</label>
+  <button class="save" id="save">Сохранить выбор</button>
+  <div class="keys" id="keys"></div>
+</header>
+<main id="list"></main>
+<audio id="audio"></audio>
+<script>
+const ITEMS = /*ITEMS*/[];
+const SAVE_AS = /*SAVE_AS*/'jarvis_review.json';
+// Страницы с диска делят одно хранилище — ключ по пути, чтобы отметки разных страниц не смешались.
+const KEY = 'jarvis-review:' + location.pathname;
+const LABELS = /*LABELS*/{ 1: 'Джарвис, чисто', 2: 'Джарвис, шум', 3: 'Не он' };
+document.getElementById('keys').innerHTML = '<kbd>Пробел</kbd> играть · '
+  + [1, 2, 3].map(v => `<kbd>${v}</kbd> ${LABELS[v]}`).join(' · ')
+  + ' · <kbd>↑</kbd><kbd>↓</kbd> по списку · текст можно исправить щелчком';
+let state = {};
+try { state = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) { state = {}; }
+const audio = document.getElementById('audio');
+const list = document.getElementById('list');
+let cur = 0;
+
+function persist() {
+  try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { /* без хранилища — только файл */ }
+  const done = ITEMS.filter(i => state[i.id] && state[i.id].v).length;
+  document.getElementById('count').textContent = `отмечено ${done} из ${ITEMS.length}`;
+  document.getElementById('bar').style.width = (100 * done / ITEMS.length) + '%';
+}
+
+function fmt(t) { const m = Math.floor(t / 60); return `${m}:${(t % 60).toFixed(1).padStart(4, '0')}`; }
+
+ITEMS.forEach((item, idx) => {
+  const s = state[item.id] || {};
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.dataset.idx = idx;
+  if (s.v) row.dataset.v = s.v;
+  const where = item.start !== undefined ? `${item.src} ${fmt(item.start)}` : item.src;
+  row.innerHTML = `
+    <button class="play" title="Играть">▶</button>
+    <div><input class="text" value=""><div class="meta">№${item.id} · ${where} · похожесть ${item.score.toFixed(2)}${item.orig ? ` · <a href="${item.orig}" target="_blank">до очистки</a>` : ''}<span class="note"></span></div></div>
+    <div class="choice">${[1, 2, 3].map(v => `<button class="c${v}" data-v="${v}">${v} ${LABELS[v]}</button>`).join('')}</div>`;
+  if (item.note) row.querySelector('.note').textContent = ' · ' + item.note;
+  const input = row.querySelector('.text');
+  input.value = s.text !== undefined ? s.text : item.text;
+  input.classList.toggle('edited', input.value !== item.text);
+  input.addEventListener('input', () => {
+    state[item.id] = Object.assign(state[item.id] || {}, { text: input.value });
+    input.classList.toggle('edited', input.value !== item.text);
+    persist();
+  });
+  input.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === 'Escape') input.blur(); });
+  row.querySelector('.play').addEventListener('click', () => { select(idx); play(); });
+  row.querySelectorAll('.choice button').forEach(b => b.addEventListener('click', () => { select(idx); mark(+b.dataset.v, false); }));
+  list.appendChild(row);
+});
+
+function rows() { return [...list.children]; }
+function visible(i) { return !rows()[i].classList.contains('hidden'); }
+
+function select(idx, scroll) {
+  rows()[cur].classList.remove('cur');
+  cur = idx;
+  const row = rows()[cur];
+  row.classList.add('cur');
+  if (scroll) row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+function play() { audio.src = ITEMS[cur].file; audio.play(); }
+
+function step(dir) {
+  for (let i = cur + dir; i >= 0 && i < ITEMS.length; i += dir) {
+    if (visible(i)) { select(i, true); return true; }
+  }
+  return false;
+}
+
+function mark(v, advance) {
+  const item = ITEMS[cur];
+  state[item.id] = Object.assign(state[item.id] || {}, { v });
+  rows()[cur].dataset.v = v;
+  persist();
+  if (advance && step(1)) play(); else audio.pause();
+  applyFilter();
+}
+
+function applyFilter() {
+  const todo = document.getElementById('todo').checked;
+  rows().forEach((row, i) => row.classList.toggle('hidden', todo && i !== cur && !!(state[ITEMS[i].id] || {}).v));
+}
+
+document.getElementById('todo').addEventListener('change', applyFilter);
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' && e.target.type !== 'checkbox') return;
+  if (e.key === ' ') { e.preventDefault(); if (!audio.paused && audio.src.endsWith(ITEMS[cur].file)) audio.pause(); else play(); }
+  else if (['1', '2', '3'].includes(e.key)) mark(+e.key, true);
+  else if (e.key === 'ArrowDown') { e.preventDefault(); step(1); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); step(-1); }
+});
+
+document.getElementById('save').addEventListener('click', () => {
+  const out = ITEMS.map(i => Object.assign({}, i, { text: (state[i.id] || {}).text ?? i.text,
+                                                    verdict: (state[i.id] || {}).v || 0 }));
+  const blob = new Blob([JSON.stringify(out, null, 1)], { type: 'application/json' });
+  const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: SAVE_AS });
+  a.click();
+});
+
+select(0);
+persist();
+</script>
+</body>
+</html>
