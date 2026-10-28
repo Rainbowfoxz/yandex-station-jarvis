@@ -15,9 +15,9 @@ rm -rf "$OUT" && mkdir -p "$OUT/lib"
 
 # Ловец имени: C + libvosk под aarch64 с glibc 2.31 из lib/.
 (cd "$VOSK" && "$ZIG" cc -target aarch64-linux-gnu.2.31 -mcpu=cortex_a53 -O2 -s -Wall -I. \
-  "$HERE/kws/kws.c" libvosk.so -lm -o "$OUT/jarvis-kws")
+  "$HERE/kws/kws.c" "$HERE/kws/aec.c" -I"$HERE/kws" libvosk.so -lm -o "$OUT/jarvis-kws")
 # Основная программа: Go без cgo — один статический файл.
-(cd "$HERE/jarvis" && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 "$GO" build -trimpath -ldflags="-s -w" -o "$OUT/jarvis" .)
+(cd "$HERE/jarvis" && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 "$GO" build -trimpath -buildvcs=false -ldflags="-s -w" -o "$OUT/jarvis" .)
 
 cp "$VOSK/libvosk.so" "$OUT/lib/"
 for f in ld-linux-aarch64.so.1 libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 libgcc_s.so.1 libstdc++.so.6 libatomic.so.1; do

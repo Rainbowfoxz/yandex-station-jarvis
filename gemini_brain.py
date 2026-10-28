@@ -9,7 +9,9 @@
 
     py gemini_brain.py "кто написал войну и мир"     # проверка без колонки
 """
+import base64
 import io
+import json
 import os
 import pathlib
 import queue
@@ -18,12 +20,14 @@ import re
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import wave
 
-from google import genai
-from google.genai import types
-
 from jarvis_settings import GEMINI_ENV_FILE as ENV_FILE  # noqa: E402
+# REST напрямую, без google-genai: библиотека с зависимостями занимала большую часть памяти слушателя
+# и полминуты его запуска, а от неё нужен один запрос. Ответ — потоком (SSE), как generate_content_stream.
+API = 'https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse'
 # Lite — первой: для колонки скорость важнее (1–6 с), и она отвечала, когда старшие давали 503/тайм-аут.
 # Слабее в фактах — при её сбое пробуем старшие. У каждой версии своя очередь и квота у Google: 28.10
 # lite (504) и flash-latest (503) лежали, а 3.6 и 3.5 отвечали на голосовой вопрос за 2,6–3,2 с.
@@ -115,24 +119,61 @@ def api_key():
     return key
 
 
+class Stream:
+    """Ответ модели кусками текста (SSE «data: {…}»); close() обрывает соединение — Google перестаёт писать."""
+
+    def __init__(self, response):
+        self.response = response
+
+    def __iter__(self):
+        for raw in self.response:
+            line = raw.decode('utf-8', errors='replace').strip()
+            if not line.startswith('data:'):
+                continue
+            chunk = json.loads(line[5:])
+            for candidate in chunk.get('candidates', [])[:1]:
+                for part in candidate.get('content', {}).get('parts', []):
+                    if part.get('text') and not part.get('thought'):
+                        yield part['text']
+
+    def close(self):
+        try:
+            self.response.close()
+        except Exception:   # закрываем из другого потока, пока тот читает, — ошибки не важны
+            pass
+
+
 class Brain:
     def __init__(self):
-        key = api_key()
         # Ключ «AQ.…» — новый формат ключей Gemini API (не Vertex: там API в проекте выключен, 403).
-        # Без автоповторов SDK: по умолчанию 5 попыток с паузами 1–8 с — колонка молчала бы секунды.
-        self.client = genai.Client(vertexai=False, api_key=key, http_options=types.HttpOptions(
-            timeout=TIMEOUT_MS, retry_options=types.HttpRetryOptions(attempts=1)))
-        # Для колонки скорость важнее рассуждений: с ними ответ шёл 4–5 с вместо долей секунды.
-        self.configs = {model: types.GenerateContentConfig(
-            system_instruction=PERSONA + (SEARCH_HINT if SEARCH else ''), temperature=0.7,
-            max_output_tokens=400, tools=[types.Tool(google_search=types.GoogleSearch())] if SEARCH else None,
-            thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL
-                                                 if model in MINIMAL_THINKING else types.ThinkingLevel.LOW))
-            for model in MODELS}
+        # Автоповторов нет: при сбое сразу пробуем другую модель, а не ждём паузы 1–8 с.
+        self.key = api_key()
         self.model = None
         self.fallback_at = 0.0    # когда ответила запасная модель (а не MODELS[0])
-        self.history = []     # types.Content по очереди: user, model, ...
+        self.history = []     # {'role': 'user'|'model', 'parts': [...]} по очереди
         self.last = 0.0
+
+    def _open(self, model, contents):
+        """Запрос к модели -> Stream. Ошибка HTTP -> RuntimeError «код СТАТУС. сообщение» (как писал SDK)."""
+        # Для колонки скорость важнее рассуждений: с ними ответ шёл 4–5 с вместо долей секунды.
+        body = {'system_instruction': {'parts': [{'text': PERSONA + (SEARCH_HINT if SEARCH else '')}]},
+                'contents': contents,
+                'generationConfig': {'temperature': 0.7, 'maxOutputTokens': 400, 'thinkingConfig': {
+                    'thinkingLevel': 'MINIMAL' if model in MINIMAL_THINKING else 'LOW'}}}
+        if SEARCH:
+            body['tools'] = [{'google_search': {}}]
+        request = urllib.request.Request(API.format(model=model), data=json.dumps(body).encode('utf-8'),
+                                         headers={'x-goog-api-key': self.key,
+                                                  'Content-Type': 'application/json'})
+        try:
+            return Stream(urllib.request.urlopen(request, timeout=TIMEOUT_MS / 1000))
+        except urllib.error.HTTPError as error:
+            try:
+                info = json.loads(error.read()).get('error', {})
+            except ValueError:
+                info = {}
+            raise RuntimeError(f'{error.code} {info.get("status", error.reason)}. '
+                               f'{info.get("message", "")[:120]}') from None
 
     def ask(self, question, audio=None):
         """Вопрос текстом или звуком (PCM S16_LE 16 кГц моно) -> (вид, текст, что услышано):
@@ -154,12 +195,12 @@ class Brain:
             self.history.clear()
         joke = joke_hint()
         if audio is None:
-            parts = [types.Part(text=f'{question}\n{joke}')]
+            parts = [{'text': f'{question}\n{joke}'}]
         else:
-            parts = [types.Part.from_bytes(data=to_wav(audio), mime_type='audio/wav'),
-                     types.Part(text=f'{AUDIO_PROMPT}\n{joke}')]
+            parts = [{'inline_data': {'mime_type': 'audio/wav', 'data': base64.b64encode(to_wav(audio)).decode()}},
+                     {'text': f'{AUDIO_PROMPT}\n{joke}'}]
         full, buf, kind, heard = '', '', None, question
-        for chunk in self._stream(self.history + [types.Content(role='user', parts=parts)]):
+        for chunk in self._stream(self.history + [{'role': 'user', 'parts': parts}]):
             full += chunk
             buf += chunk
             while kind is None:              # начало ответа: «ВОПРОС:», «АЛИСА:» или сразу речь
@@ -195,8 +236,8 @@ class Brain:
             yield 'say', clean(buf)
         # В память — текстом: звук прошлых вопросов модели не нужен, а запрос с ним тяжелее.
         answer = split_heard(full.strip(), question)[1]
-        self.history = (self.history + [types.Content(role='user', parts=[types.Part(text=heard)]),
-                                        types.Content(role='model', parts=[types.Part(text=answer)])])[-2 * MAX_TURNS:]
+        self.history = (self.history + [{'role': 'user', 'parts': [{'text': heard}]},
+                                        {'role': 'model', 'parts': [{'text': answer}]}])[-2 * MAX_TURNS:]
         self.last = time.monotonic()
 
     def _stream(self, contents):
@@ -208,14 +249,19 @@ class Brain:
             self.model = None
         waiting = sorted(MODELS, key=lambda m: m != self.model)
         results = queue.Queue()
+        opened, won = [], threading.Event()   # проигравшие соединения обрываем: модель перестаёт писать впустую
 
         def start(model):
             try:
-                stream = self.client.models.generate_content_stream(model=model, contents=contents,
-                                                                    config=self.configs[model])
-                results.put((model, stream, next(stream, None), None))
-            except Exception as exc:   # модели нет на этом ключе, перегрузка, тайм-аут
-                results.put((model, None, None, exc))
+                stream = self._open(model, contents)
+                opened.append(stream)
+                if won.is_set():
+                    stream.close()
+                    return
+                chunks = iter(stream)
+                results.put((model, stream, chunks, next(chunks, None), None))
+            except Exception as exc:   # модели нет на этом ключе, перегрузка, тайм-аут, оборвали сами
+                results.put((model, None, None, None, exc))
 
         running, error, give_up = 0, None, time.monotonic() + TRY_SECONDS
         while running < RACE and waiting:
@@ -223,7 +269,7 @@ class Brain:
             running += 1
         while running:
             try:
-                model, stream, first, exc = results.get(timeout=max(0.1, give_up - time.monotonic()))
+                model, stream, chunks, first, exc = results.get(timeout=max(0.1, give_up - time.monotonic()))
             except queue.Empty:
                 break
             running -= 1
@@ -233,14 +279,23 @@ class Brain:
                     threading.Thread(target=start, args=(waiting.pop(0),), daemon=True).start()
                     running += 1
                 continue
-            # Остальные участники гонки дорабатывают в своих потоках, их ответы не читаем.
+            won.set()
+            for other in list(opened):
+                if other is not stream:
+                    other.close()
             if model != MODELS[0] and model != self.model:   # отсчёт 10 мин — с перехода на запасную
                 self.fallback_at = time.monotonic()
             self.model = model
-            for chunk in [first, *stream] if first is not None else []:
-                if chunk.text:
-                    yield chunk.text
+            try:
+                if first is not None:
+                    yield first
+                    yield from chunks
+            finally:
+                stream.close()
             return
+        won.set()
+        for other in list(opened):
+            other.close()
         raise error or TimeoutError(f'ни одна модель не ответила за {TRY_SECONDS} с')
 
 

@@ -1,11 +1,12 @@
 // jarvis-kws MODEL — ловит «Джарвис» в потоке микрофона колонки (stdin: 6 каналов S16LE 48 кГц,
 // как его отдаёт pull.sh) и пишет в stdout строку WAKE. Первая строка после загрузки модели — READY.
-// Берётся микрофон 0, фильтр нижних частот и прореживание до 16 кГц — как MicDecoder в jarvis_wake.py,
-// но без вычитания музыки.
+// Микрофон 0 и опоры динамика (каналы 4–5): фильтр нижних частот, прореживание до 16 кГц и вычитание
+// эха (aec.c) — как MicDecoder в jarvis_wake.py. Без вычитания под музыкой имя не слышно.
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "aec.h"
 #include "vosk_api.h"
 
 #define CHANNELS 6
@@ -17,13 +18,13 @@
 // (после паузы ~0,5 с) и уверенность Vosk в слове не ниже CONF_MIN (меняется переменной KWS_CONF).
 // Каждый кандидат пишется в stderr с уверенностью и длиной слова — по ним подбирается порог.
 #define CONF_MIN 0.9
+#define PARTIAL_HITS 3   // под музыкой: имя в промежуточном результате столько обновлений подряд (блоков)
 // После срабатывания распознавание сбрасывается и через 0,3 с снова видит хвост того же имени:
 // столько кадров 48 кГц новых срабатываний не даём (2,5 с).
 #define QUIET_FRAMES 120000
-// Каналы 4–5 — опора: что сейчас играет динамик. Вычитания эха здесь нет, поэтому пока динамик звучит
-// (и ещё 1,5 с после), имя не засчитываем: голос Алисы из динамика ловец принимал за «Джарвис».
-// Порог — СКО опоры за блок, как REF_ACTIVE в aec.py: в тишине канал 4 — нули, 5 — смещение ~17.
-#define REF_ACTIVE 20.0
+// «Звучит динамик» — опора выше AEC_REF_ACTIVE за последние 1,5 с: пишется в журнал у кандидата,
+// а с KWS_GATE=1 имя тогда не засчитывается (так было до вычитания эха: голос Алисы ловец принимал
+// за «Джарвис»).
 #define SPEAKER_HOLD 72000
 
 static float taps[TAPS];
@@ -41,21 +42,6 @@ static void make_taps(void) {
     for (int i = 0; i < TAPS; i++) taps[i] /= (float)sum;
 }
 
-// СКО опорных каналов за блок (каждый канал — относительно своего среднего).
-static double speaker_level(const short *in, size_t frames) {
-    double sum = 0;
-    for (int c = 4; c <= 5; c++) {
-        double s = 0, s2 = 0;
-        for (size_t i = 0; i < frames; i++) {
-            double v = in[i * CHANNELS + c];
-            s += v;
-            s2 += v * v;
-        }
-        double mean = s / frames;
-        sum += s2 / frames - mean * mean;
-    }
-    return sqrt(sum / 2);
-}
 
 // Самая уверенная «джарвис» в результате Vosk со словами: {"result":[{"conf":…,"end":…,"start":…,
 // "word":"джарвис"},…],"text":…}. Возвращает уверенность (или -1) и длину слова в секундах.
@@ -92,18 +78,25 @@ int main(int argc, char **argv) {
     vosk_recognizer_set_words(rec, 1);  // уверенность и время каждого слова
     const char *env = getenv("KWS_CONF");
     double conf_min = env ? atof(env) : CONF_MIN;
-    int gate = getenv("KWS_NO_GATE") == NULL;  // проверка на записях, где «Джарвис» звучит из динамика
+    // KWS_GATE=1 — как до вычитания эха: пока звучит динамик, имя не засчитывать.
+    int gate = getenv("KWS_GATE") != NULL;
+    int cancel = getenv("KWS_NO_AEC") == NULL;  // KWS_NO_AEC=1 — без вычитания (сравнение на записях)
     make_taps();
+    static Aec aec;
+    aec_init(&aec, 1);
     puts("READY");
     fflush(stdout);
 
+    // Каналы через фильтр и прореживание до 16 кГц: микрофон и две опоры (что играет динамик).
+    static const int chans[3] = {MIC, 4, 5};
     static short in[BLOCK * CHANNELS];
-    static float hist[TAPS - 1 + BLOCK];  // хвост прошлого блока + текущий, один канал
-    static short out[BLOCK / 3 + 1];
+    static float hist[3][TAPS - 1 + BLOCK];  // хвост прошлого блока + текущий
+    static float pend[3][AEC_BLOCK + BLOCK / 3 + 1];  // 16 кГц, ещё не собрано в блок вычитания
+    static short out[BLOCK / 3 + AEC_BLOCK];
     memset(hist, 0, sizeof hist);
-    int phase = 0;
+    int phase = 0, pending = 0, hits = 0;
     size_t carry = 0;  // байт неполного кадра с прошлого чтения
-    long total = 0;    // кадров с начала
+    long total = 0;    // кадров 48 кГц с начала
     long quiet_until = 0;
     long played = -SPEAKER_HOLD;  // кадр, на котором динамик звучал последний раз
     for (;;) {
@@ -112,28 +105,67 @@ int main(int argc, char **argv) {
         got += carry;
         size_t frames = got / (CHANNELS * 2);
         carry = got - frames * CHANNELS * 2;
-        for (size_t i = 0; i < frames; i++) hist[TAPS - 1 + i] = in[i * CHANNELS + MIC];
-        if (frames && speaker_level(in, frames) > REF_ACTIVE) played = total + (long)frames;
         int n = 0;
-        for (size_t i = phase; i < frames; i += 3) {
-            float acc = 0;
-            for (int k = 0; k < TAPS; k++) acc += taps[k] * hist[i + k];
-            out[n++] = acc > 32767 ? 32767 : acc < -32768 ? -32768 : (short)acc;
+        for (int c = 0; c < 3; c++) {
+            float *h = hist[c];
+            for (size_t i = 0; i < frames; i++) h[TAPS - 1 + i] = in[i * CHANNELS + chans[c]];
+            n = 0;
+            for (size_t i = phase; i < frames; i += 3) {
+                float acc = 0;
+                for (int k = 0; k < TAPS; k++) acc += taps[k] * h[i + k];
+                pend[c][pending + n++] = acc;
+            }
+            memmove(h, h + frames, (TAPS - 1) * sizeof(float));
         }
         phase = (int)((phase - (long)frames) % 3 + 3) % 3;
-        memmove(hist, hist + frames, (TAPS - 1) * sizeof(float));
+        pending += n;
         if (carry) memmove(in, (char *)in + frames * CHANNELS * 2, carry);
-
         total += frames;
-        if (!vosk_recognizer_accept_waveform(rec, (const char *)out, n * 2)) continue;
-        double seconds = 0, conf = name_conf(vosk_recognizer_result(rec), &seconds);
+
+        // Блоками по AEC_BLOCK: микрофон минус эхо динамика (aec.c — перенос aec.py).
+        int m = 0, done = 0;
+        for (; pending - done >= AEC_BLOCK; done += AEC_BLOCK) {
+            float r[AEC_REFS][AEC_BLOCK], clean[AEC_BLOCK];
+            memcpy(r[0], pend[1] + done, sizeof r[0]);
+            memcpy(r[1], pend[2] + done, sizeof r[1]);
+            const float *src = pend[0] + done;
+            if (aec_block(&aec, src, r, clean)) played = total;
+            if (cancel) src = clean;
+            for (int i = 0; i < AEC_BLOCK; i++)
+                out[m++] = src[i] > 32767 ? 32767 : src[i] < -32768 ? -32768 : (short)src[i];
+        }
+        for (int c = 0; c < 3; c++) memmove(pend[c], pend[c] + done, (pending - done) * sizeof(float));
+        pending -= done;
+        if (!m) continue;
+        int music = total - played < SPEAKER_HOLD;
+        double seconds = 0, conf;
+        if (vosk_recognizer_accept_waveform(rec, (const char *)out, m * 2)) {
+            hits = 0;
+            conf = name_conf(vosk_recognizer_result(rec), &seconds);
+        } else if (music) {
+            // Под музыкой паузы нет и окончательного результата Vosk не даёт (имя не находилось ни с
+            // вычитанием, ни без) — как jarvis_wake.py, смотрим промежуточный: имя держится PARTIAL_HITS
+            // обновлений подряд. Уверенности у промежуточного нет — в журнале 0.
+            hits = strstr(vosk_recognizer_partial_result(rec), "джарвис") ? hits + 1 : 0;
+            if (hits < PARTIAL_HITS) continue;
+            hits = 0;
+            conf = 1;
+            vosk_recognizer_reset(rec);
+        } else {
+            hits = 0;
+            continue;
+        }
         if (conf < 0) continue;
         const char *verdict = "WAKE";
         if (conf < conf_min) verdict = "мало уверенности";
         else if (total < quiet_until) verdict = "повтор";
-        else if (gate && total - played < SPEAKER_HOLD) verdict = "звучит динамик";
-        fprintf(stderr, "%.1f с: «джарвис» уверенность %.2f, %.2f с -> %s\n", total / 48000.0, conf,
-                seconds, verdict);
+        else if (gate && music) verdict = "звучит динамик";
+        if (seconds > 0)
+            fprintf(stderr, "%.1f с: «джарвис» уверенность %.2f, %.2f с%s -> %s\n", total / 48000.0, conf,
+                    seconds, music ? ", звучит динамик" : "", verdict);
+        else
+            fprintf(stderr, "%.1f с: «джарвис» под музыкой (промежуточный результат) -> %s\n", total / 48000.0,
+                    verdict);
         if (verdict[0] == 'W') {
             quiet_until = total + QUIET_FRAMES;
             puts("WAKE");
