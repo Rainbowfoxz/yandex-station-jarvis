@@ -1,0 +1,4 @@
+# Скрипты для колонки (busybox sh) — только LF, иначе с core.autocrlf=true они ломаются на колонке.
+*.sh text eol=lf
+S99zdropbear text eol=lf
+*.asoundrc text eol=lf
