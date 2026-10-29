@@ -20,6 +20,11 @@
 // Каждый кандидат пишется в stderr с уверенностью и длиной слова — по ним подбирается порог.
 #define CONF_MIN 0.9
 #define PARTIAL_HITS 3   // под музыкой: имя в промежуточном результате столько обновлений подряд (блоков)
+// Промежуточное имя под музыкой — только кандидат: 29.10 ловец дважды сработал на голос самого Джарвиса из
+// динамика. Дослушиваем CONFIRM отсчётов 16 кГц (кандидат приходит посреди слова) и требуем окончательный
+// результат с той же уверенностью CONF_MIN. На отрывках: 6 настоящих «Джарвис» (и при голосе на 10 дБ тише
+// музыки) проходят с 1,00, оба ложных — без имени; с 0,3 с один настоящий терялся.
+#define CONFIRM 8000
 // После срабатывания распознавание сбрасывается и через 0,3 с снова видит хвост того же имени:
 // столько кадров 48 кГц новых срабатываний не даём (2,5 с).
 #define QUIET_FRAMES 120000
@@ -29,7 +34,7 @@
 #define SPEAKER_HOLD 72000
 // Звук каждого кандидата (после вычитания эха, 16 кГц S16LE): CLIP_BEFORE до него и CLIP_AFTER после —
 // под музыкой кандидат приходит посреди слова. Последние CLIPS файлов в папке KWS_CLIPS (/tmp — оперативная
-// память, 30 × 80 КБ); номер файла пишется в журнал у кандидата. По ним подбирается вторая проверка на ПК.
+// память, 30 × 80 КБ); номер файла пишется в журнал у кандидата. По ним подбираются пороги и проверки.
 #define CLIP_BEFORE 32000
 #define CLIP_AFTER 8000
 #define CLIP (CLIP_BEFORE + CLIP_AFTER)
@@ -105,7 +110,8 @@ int main(int argc, char **argv) {
     if (!clips) clips = "/tmp/jarvis-clips";
     if (*clips) mkdir(clips, 0755);
     int clip_slot = 0;
-    long clip_at = -1;  // когда (в отсчётах 16 кГц) сохранить звук последнего кандидата
+    long clip_at = -1;     // когда (в отсчётах 16 кГц) сохранить звук последнего кандидата
+    long confirm_at = -1;  // когда проверить промежуточное имя окончательным результатом
     make_taps();
     static Aec aec;
     aec_init(&aec, 1);
@@ -170,25 +176,32 @@ int main(int argc, char **argv) {
         if (!m) continue;
         int music = total - played < SPEAKER_HOLD;
         double seconds = 0, conf;
+        int checked = 0;  // окончательный результат вытребован после промежуточного имени
         if (vosk_recognizer_accept_waveform(rec, (const char *)out, m * 2)) {
             hits = 0;
+            confirm_at = -1;
             conf = name_conf(vosk_recognizer_result(rec), &seconds);
+        } else if (confirm_at >= 0) {
+            if (heard < confirm_at) continue;
+            confirm_at = -1;
+            checked = 1;
+            conf = name_conf(vosk_recognizer_final_result(rec), &seconds);
         } else if (music) {
-            // Под музыкой паузы нет и окончательного результата Vosk не даёт (имя не находилось ни с
-            // вычитанием, ни без) — как jarvis_wake.py, смотрим промежуточный: имя держится PARTIAL_HITS
-            // обновлений подряд. Уверенности у промежуточного нет — в журнале 0.
+            // Под музыкой паузы нет и окончательного результата Vosk сам не даёт — смотрим промежуточный:
+            // имя держится PARTIAL_HITS обновлений подряд, тогда через CONFIRM требуем окончательный.
             hits = strstr(vosk_recognizer_partial_result(rec), "джарвис") ? hits + 1 : 0;
             if (hits < PARTIAL_HITS) continue;
             hits = 0;
-            conf = 1;
-            vosk_recognizer_reset(rec);
+            confirm_at = heard + CONFIRM;
+            continue;
         } else {
             hits = 0;
             continue;
         }
-        if (conf < 0) continue;
+        if (conf < 0 && !checked) continue;
         const char *verdict = "WAKE";
-        if (conf < conf_min) verdict = "мало уверенности";
+        if (conf < 0) verdict = "в окончательном результате имени нет";
+        else if (conf < conf_min) verdict = "мало уверенности";
         else if (total < quiet_until) verdict = "повтор";
         else if (gate && music) verdict = "звучит динамик";
         char clip[32] = "";
@@ -200,12 +213,13 @@ int main(int argc, char **argv) {
             clip_at = heard + CLIP_AFTER;
             snprintf(clip, sizeof clip, " [звук %02d.raw]", clip_slot);
         }
-        if (seconds > 0)
-            fprintf(stderr, "%.1f с: «джарвис» уверенность %.2f, %.2f с%s -> %s%s\n", total / 48000.0, conf,
-                    seconds, music ? ", звучит динамик" : "", verdict, clip);
-        else
+        if (conf < 0)
             fprintf(stderr, "%.1f с: «джарвис» под музыкой (промежуточный результат) -> %s%s\n",
                     total / 48000.0, verdict, clip);
+        else
+            fprintf(stderr, "%.1f с: «джарвис»%s уверенность %.2f, %.2f с%s -> %s%s\n", total / 48000.0,
+                    checked ? " под музыкой, проверка:" : "", conf, seconds, music ? ", звучит динамик" : "",
+                    verdict, clip);
         if (verdict[0] == 'W') {
             quiet_until = total + QUIET_FRAMES;
             puts("WAKE");
